@@ -1,0 +1,208 @@
+name: Solara Release
+
+# Triggers:
+#   - Push a tag like "solara-v1.0.0" to start a full cross-platform build + release
+#   - Manual dispatch with a version string
+on:
+  push:
+    tags:
+      - 'solara-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 1.0.0)'
+        required: true
+        default: '1.0.0'
+
+env:
+  BUILD_TYPE: Release
+
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  # ── Windows ──────────────────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          lfs: true
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Install WebView2 (required by CloudWash in monorepo)
+        shell: powershell
+        run: |
+          Register-PackageSource -provider NuGet -name nugetRepository -location https://www.nuget.org/api/v2 -Force
+          Install-Package Microsoft.Web.WebView2 -Scope CurrentUser -RequiredVersion 1.0.3485.44 -Source nugetRepository -Force
+
+      - name: Configure CMake
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DAPC_ENABLE_VISAGE=ON
+
+      - name: Build VST3
+        run: cmake --build build --target Solara_VST3
+
+      - name: Package (VST3 + Presets)
+        shell: bash
+        run: |
+          mkdir -p release/Solara-Windows
+          find build -name "Solara.vst3" -exec cp -R {} release/Solara-Windows/ \;
+          cp -R Presets "release/Solara-Windows/Solara Presets"
+          echo "Contents:" && ls -R release/Solara-Windows
+          cd release && 7z a Solara-Windows.zip Solara-Windows/
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: Solara-Windows
+          path: release/Solara-Windows.zip
+          if-no-files-found: error
+
+  # ── macOS ─────────────────────────────────────────────────────────────────
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          lfs: true
+
+      - name: Configure CMake
+        run: |
+          cmake -S . -B build -G Xcode \
+            -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 \
+            -DCMAKE_CXX_STANDARD=17 \
+            -DCMAKE_OBJCXX_STANDARD=17 \
+            -DCMAKE_XCODE_ATTRIBUTE_CLANG_CXX_LANGUAGE_STANDARD="c++17" \
+            -DCMAKE_XCODE_ATTRIBUTE_CLANG_CXX_LIBRARY="libc++" \
+            -DAPC_ENABLE_VISAGE=ON
+
+      - name: Build VST3
+        run: cmake --build build --config Release --target Solara_VST3
+
+      - name: Package (VST3 + Presets)
+        run: |
+          mkdir -p release/Solara-macOS
+          find build -name "Solara.vst3" -exec cp -R {} release/Solara-macOS/ \;
+          cp -R Presets "release/Solara-macOS/Solara Presets"
+          echo "Contents:" && ls -R release/Solara-macOS
+          cd release && zip -r Solara-macOS.zip Solara-macOS/
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: Solara-macOS
+          path: release/Solara-macOS.zip
+          if-no-files-found: error
+
+  # ── Linux ─────────────────────────────────────────────────────────────────
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          lfs: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            libasound2-dev \
+            libfreetype6-dev \
+            libgl1-mesa-dev \
+            libx11-dev \
+            libxcomposite-dev \
+            libxcursor-dev \
+            libxext-dev \
+            libxinerama-dev \
+            libxrandr-dev \
+            libgtk-3-dev \
+            libjack-jackd2-dev
+
+      - name: Configure CMake
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAPC_ENABLE_VISAGE=ON
+
+      - name: Build VST3
+        run: cmake --build build --target Solara_VST3
+
+      - name: Package (VST3 + Presets)
+        run: |
+          mkdir -p release/Solara-Linux
+          find build -name "Solara.vst3" -exec cp -R {} release/Solara-Linux/ \;
+          cp -R Presets "release/Solara-Linux/Solara Presets"
+          echo "Contents:" && ls -R release/Solara-Linux
+          cd release && zip -r Solara-Linux.zip Solara-Linux/
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: Solara-Linux
+          path: release/Solara-Linux.zip
+          if-no-files-found: error
+
+  # ── Create GitHub Release ──────────────────────────────────────────────────
+  release:
+    needs: [build-windows, build-macos, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "push" ]; then
+            # Strip "solara-v" prefix from tag name
+            VERSION="${GITHUB_REF_NAME#solara-v}"
+          else
+            VERSION="${{ inputs.version }}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=solara-v$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "Solara v${{ steps.version.outputs.version }}"
+          body: |
+            ## Solara v${{ steps.version.outputs.version }}
+
+            ### Installation
+
+            **Each zip contains:**
+            - `Solara.vst3` — the plugin
+            - `Presets/` — factory preset library (copy to `Documents/Solara/Presets/`)
+
+            **Windows**
+            1. Unzip `Solara-Windows.zip`
+            2. Copy `Solara.vst3` → `C:\Program Files\Common Files\VST3\`
+            3. Copy `Presets\` folder → `Documents\Solara\Presets\`
+
+            **macOS**
+            1. Unzip `Solara-macOS.zip`
+            2. Copy `Solara.vst3` → `/Library/Audio/Plug-Ins/VST3/`
+            3. Copy `Presets/` folder → `~/Documents/Solara/Presets/`
+
+            **Linux**
+            1. Unzip `Solara-Linux.zip`
+            2. Copy `Solara.vst3` → `~/.vst3/` or `/usr/lib/vst3/`
+            3. Copy `Presets/` folder → `~/Documents/Solara/Presets/`
+          files: |
+            artifacts/Solara-Windows/Solara-Windows.zip
+            artifacts/Solara-macOS/Solara-macOS.zip
+            artifacts/Solara-Linux/Solara-Linux.zip
+          draft: false
+          prerelease: false
+          generate_release_notes: false
